@@ -72,8 +72,8 @@ def call(text):
         return
     # stejný formát jako ručně ověřený odkaz (anglický hlas, text bez diakritiky)
     text = "IRONMAN HRADEC KRALOVE ALERT. CHECK NTFY NOW."
-    q = urllib.parse.urlencode({"source": "web", "user": CALLMEBOT_USER,
-                                "text": text, "lang": "en-US-Standard-B"})
+    q = ("source=web&user=" + urllib.parse.quote(CALLMEBOT_USER, safe="+@")
+         + "&text=" + urllib.parse.quote(text) + "&lang=en-US-Standard-B")
     try:
         r = requests.get(f"http://api.callmebot.com/start.php?{q}", timeout=120)
         soup = BeautifulSoup(r.text, "html.parser")
