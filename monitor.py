@@ -2,19 +2,21 @@
 """
 Hlídač registrace IRONMAN 70.3 Hradec Králové 2027.
 
-Co dělá při každém spuštění (GitHub Actions, každých ~10 min):
-  1) Projde nová ID akcí na slotmarket.pl (registrační systém organizátora
-     Sport Evolution). Ročník 2026 měl ID 737 -> ročník 2027 dostane nové ID.
-     Jakmile se objeví stránka "IRONMAN 70.3 HRADEC KRÁLOVÉ 2027" -> POPLACH.
-  2) Pak tu stránku hlídá, a když zmizí "Registration closed" a objeví se
-     cena startovného -> POPLACH "REGISTRACE OTEVŘENA" (opakuje se 1 hodinu).
-  3) Hlídá i další stránky (ironman.com, ironmanczech.com) a při změně
-     textu kolem registrace pošle běžnou notifikaci.
+Slotmarket (registrační systém organizátora) má JSON API:
+  https://slotmarket.pl/api/event/<id>
+Ročník 2027 už v systému existuje jako akce ID 835
+("IRONMAN 70.3 HRADEC KRÁLOVÉ 2027", 15. 8. 2027), zatím neaktivní,
+bez ceny a s 0 sloty. Bot ji kontroluje každých ~10 minut a spustí POPLACH,
+jakmile se objeví cena, volné sloty, nebo se akce zaktivní.
 
-Notifikace: ntfy.sh (push s nejvyšší prioritou) + volitelně hovor přes
-CallMeBot (Telegram call). Viz README.md.
+Pojistky:
+  - kdyby organizátor ID 835 smazal, bot projde nová ID a hledá akci
+    s "IRONMAN 70.3" + "HRADEC" + "2027" v názvu,
+  - když API nejde přečíst ~2 hodiny v kuse, pošle varování,
+  - 1× týdně tichá zpráva, že bot žije.
+
+Notifikace: ntfy.sh (push s nejvyšší prioritou) + hovor přes CallMeBot.
 """
-import hashlib
 import json
 import os
 import re
@@ -28,26 +30,21 @@ import requests
 from bs4 import BeautifulSoup
 
 STATE_FILE = Path(__file__).with_name("state.json")
-UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) IronmanWatcher/1.0",
-      "Accept-Language": "en,cs;q=0.8"}
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) IronmanWatcher/2.0",
+      "Accept": "application/json"}
 
-SLOT_BASE = "https://slotmarket.pl/event/details/{id}/preview"
-SLOT_WINDOW = 60          # kolik dalších ID zkusit za jedno spuštění
-TARGET_RE = re.compile(r"IRONMAN\s*70\.3\s*HRADEC\s*KR[ÁA]LOV[ÉE]\s*2027", re.I)
-CLOSED_RE = re.compile(r"Registration closed|Rejestracja zamkni|Registrace uzav", re.I)
-FEE_RE = re.compile(r"Entry fee:\s*[\d\s.,]+\s*(EUR|CZK|PLN)", re.I)
+API = "https://slotmarket.pl/api/event/{id}"
+EVENT_PAGE = "https://slotmarket.pl/event/details/{id}/{slug}"
+TARGET_ID = 835                 # IRONMAN 70.3 HRADEC KRÁLOVÉ 2027
+SCAN_FROM = 842                 # první volné ID v době psaní (2026-10-17)
+SCAN_WINDOW = 15
+NAME_RE = re.compile(r"IRONMAN\s*70\.3.*HRADEC.*2027", re.I)
 
-# Další stránky – při změně řádků s klíčovými slovy přijde běžná notifikace.
-WATCH_PAGES = [
-    "https://www.ironman.com/races/im703-hradec-kralove",
-    "https://www.ironmanczech.com/",
-]
-KEYWORD_RE = re.compile(r"2027|regist|Register|sold out|vyprod|Notify|Coming soon", re.I)
-
-URGENT_REPEAT_RUNS = 6    # po otevření registrace opakuj poplach 6× (~1 h)
+URGENT_REPEAT_RUNS = 6          # po otevření opakuj poplach 6× (~1 h)
+FAIL_WARN_RUNS = 12             # varování po ~2 h nedostupného API
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
-CALLMEBOT_USER = os.environ.get("CALLMEBOT_USER", "").strip()  # např. @hynek
+CALLMEBOT_USER = os.environ.get("CALLMEBOT_USER", "").strip()
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 
 
@@ -66,11 +63,11 @@ def ntfy(title, msg, priority=5, click=None, tags="rotating_light"):
         print("ntfy chyba:", e)
 
 
-def call(text):
+def call():
     if DRY_RUN or not CALLMEBOT_USER:
-        print(f"[call] {text}")
+        print("[call]")
         return
-    # stejný formát jako ručně ověřený odkaz (anglický hlas, text bez diakritiky)
+    # CallMeBot čte URL doslova: "+" musí zůstat "+", mezery jako %20
     text = "IRONMAN HRADEC KRALOVE ALERT. CHECK NTFY NOW."
     q = ("source=web&user=" + urllib.parse.quote(CALLMEBOT_USER, safe="+@")
          + "&text=" + urllib.parse.quote(text) + "&lang=en-US-Standard-B")
@@ -79,8 +76,7 @@ def call(text):
         soup = BeautifulSoup(r.text, "html.parser")
         for t in soup(["script", "style", "head"]):
             t.decompose()
-        info = " ".join(soup.get_text(" ").split())
-        print("callmebot:", r.status_code, info[:600])
+        print("callmebot:", r.status_code, " ".join(soup.get_text(" ").split())[:600])
     except Exception as e:
         print("callmebot chyba:", e)
 
@@ -91,119 +87,101 @@ def alarm(title, msg, url=None):
         ntfy(title, msg, priority=5, click=url)
         if i < 2:
             time.sleep(20)
-    call(f"{title}. {msg}")
+    call()
 
 
-# ---------------------------------------------------------------- utility
-def fetch_text(url):
-    r = requests.get(url, headers=UA, timeout=30)
-    if r.status_code != 200:
+# ---------------------------------------------------------------- API
+def get_event(event_id):
+    """Vrátí dict akce, None když neexistuje (404). Výjimka při jiné chybě."""
+    r = requests.get(API.format(id=event_id), headers=UA, timeout=30)
+    if r.status_code == 404:
         return None
-    soup = BeautifulSoup(r.text, "html.parser")
-    for t in soup(["script", "style", "noscript"]):
-        t.decompose()
-    return re.sub(r"[ \t]+", " ", soup.get_text("\n"))
+    r.raise_for_status()
+    return r.json()["data"]["event"]
 
 
-def load_state():
-    if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text())
-    return {}
+def summarize(e):
+    comps = e.get("competitions") or []
+    slots = sum(int(c.get("availableSlots") or 0) for c in comps)
+    prices = [c["price"] for c in comps if c.get("price")]
+    is_open = (bool(e.get("isAvailable")) or slots > 0 or bool(prices)
+               or any(c.get("isAvailable") for c in comps))
+    return {"active": bool(e.get("active")), "open": is_open,
+            "slots": slots, "prices": prices}
 
 
-def save_state(s):
-    STATE_FILE.write_text(json.dumps(s, indent=2, ensure_ascii=False) + "\n")
+def page_url(e):
+    return EVENT_PAGE.format(id=e["id"], slug=e.get("slug", ""))
 
 
-def is_open(text):
-    return bool(FEE_RE.search(text)) and not CLOSED_RE.search(text)
-
-
-# ---------------------------------------------------------------- kontroly
-def scan_slotmarket(state):
-    """Hledá novou stránku ročníku 2027."""
-    if state.get("target_url"):
-        return
-    start = state.get("max_seen_id", 824) + 1
-    for i in range(start, start + SLOT_WINDOW):
-        url = SLOT_BASE.format(id=i)
+# ---------------------------------------------------------------- logika
+def find_target(state):
+    """ID 835 nebo náhradní akce 2027, pokud by ji organizátor přečísloval."""
+    tid = state.get("target_id", TARGET_ID)
+    e = get_event(tid)
+    if e and NAME_RE.search(e.get("name", "")):
+        return e
+    start = state.get("max_seen_id", SCAN_FROM - 1) + 1
+    for i in range(start, start + SCAN_WINDOW):
         try:
-            text = fetch_text(url)
-        except Exception as e:
-            print(f"ID {i}: chyba {e}")
+            cand = get_event(i)
+        except Exception as ex:
+            print(f"ID {i}: chyba {ex}")
             continue
-        if not text or "Event name" not in text:
+        if not cand:
             continue
         state["max_seen_id"] = max(state.get("max_seen_id", 0), i)
-        name = re.search(r"Event name:\s*\n*\s*([^\n]+)", text)
-        print(f"ID {i}: {name.group(1).strip() if name else '?'}")
-        if TARGET_RE.search(text):
-            state["target_url"] = url
-            state["found_at"] = datetime.now(timezone.utc).isoformat()
-            opened = is_open(text)
-            alarm("IRONMAN HRADEC 2027 JE NA SLOTMARKETU",
-                  "Registrace je OTEVŘENÁ, běž se přihlásit!" if opened
-                  else "Stránka závodu se objevila, registrace asi startuje brzy.",
-                  url)
-            if opened:
-                state["opened"] = True
-                state["urgent_left"] = URGENT_REPEAT_RUNS - 1
-            return
+        print(f"ID {i}: {cand.get('name')}")
+        if NAME_RE.search(cand.get("name", "")):
+            state["target_id"] = i
+            ntfy("Ironman Hradec 2027 má nové ID",
+                 f"Hlídám teď akci {i}: {cand.get('name')}", priority=4,
+                 click=page_url(cand), tags="warning")
+            return cand
+    return None
 
 
-def watch_target(state):
-    """Hlídá stránku 2027, dokud se neotevře registrace."""
-    url = state.get("target_url")
-    if not url:
+def check(state):
+    e = find_target(state)
+    if not e:
+        print("Akce 2027 nenalezena")
+        state["missing_runs"] = state.get("missing_runs", 0) + 1
+        if state["missing_runs"] == FAIL_WARN_RUNS:
+            ntfy("Hlídač Ironman: akce zmizela",
+                 "Akce 2027 na slotmarketu už ~2 h není k nalezení. Zkontroluj ironmanczech.com.",
+                 priority=4, tags="warning")
         return
-    if state.get("opened"):
-        if state.get("urgent_left", 0) > 0:
-            state["urgent_left"] -= 1
-            alarm("REGISTRACE IRONMAN HRADEC OTEVŘENA",
-                  "Pořád platí – přihlas se hned!", url)
-        return
-    try:
-        text = fetch_text(url)
-    except Exception as e:
-        print("target chyba:", e)
-        return
-    if text and is_open(text):
+    state["missing_runs"] = 0
+    s = summarize(e)
+    url = page_url(e)
+    print(f"ID {e['id']} {e['name']}: active={s['active']} open={s['open']} "
+          f"slots={s['slots']} prices={s['prices']}")
+
+    if s["active"] and not state.get("active_alerted"):
+        state["active_alerted"] = True
+        if not s["open"]:
+            alarm("IRONMAN HRADEC 2027 JE ZVEŘEJNĚN",
+                  "Stránka závodu je na slotmarketu aktivní, registrace bude každou chvíli!", url)
+
+    if s["open"] and not state.get("opened"):
         state["opened"] = True
+        state["opened_at"] = datetime.now(timezone.utc).isoformat()
         state["urgent_left"] = URGENT_REPEAT_RUNS - 1
         alarm("REGISTRACE IRONMAN HRADEC OTEVŘENA",
-              "Startovné je v prodeji, běž se přihlásit!", url)
-
-
-def watch_pages(state):
-    hashes = state.setdefault("page_hashes", {})
-    for url in WATCH_PAGES:
-        try:
-            text = fetch_text(url)
-        except Exception as e:
-            print(f"{url}: chyba {e}")
-            continue
-        if not text:
-            print(f"{url}: nedostupné")
-            continue
-        lines = sorted({l.strip() for l in text.splitlines()
-                        if l.strip() and KEYWORD_RE.search(l) and len(l) < 300})
-        h = hashlib.sha256("\n".join(lines).encode()).hexdigest()
-        old = hashes.get(url)
-        hashes[url] = h
-        if old and old != h:
-            hot = [l for l in lines if "2027" in l]
-            ntfy("Změna na stránce Ironman Hradec",
-                 ("\n".join(hot[:5]) or "Změnil se text kolem registrace.") + f"\n{url}",
-                 priority=4, click=url, tags="warning")
+              f"Startovné {', '.join(s['prices']) or ''} v prodeji, volných míst: {s['slots']}. Přihlas se HNED!",
+              url)
+    elif state.get("opened") and state.get("urgent_left", 0) > 0:
+        state["urgent_left"] -= 1
+        alarm("REGISTRACE IRONMAN HRADEC OTEVŘENA",
+              "Pořád platí – přihlas se hned!", url)
 
 
 def heartbeat(state):
-    """1× týdně tichá zpráva, že bot žije (a commit, aby GitHub cron neusnul)."""
     week = datetime.now(timezone.utc).strftime("%G-W%V")
     if state.get("heartbeat") != week:
         state["heartbeat"] = week
         ntfy("Hlídač Ironman běží",
-             f"Vše OK, zatím nic. Poslední prohledané ID: {state.get('max_seen_id')}",
+             f"Vše OK, registrace zatím zavřená. Stav: {state.get('last_status', '?')}",
              priority=2, tags="white_check_mark")
 
 
@@ -212,12 +190,33 @@ def main():
         alarm("TEST hlídače Ironman", "Tohle je zkušební poplach. Funguje to.")
         return
     state = load_state()
-    scan_slotmarket(state)
-    watch_target(state)
-    watch_pages(state)
+    try:
+        check(state)
+        state["fail_runs"] = 0
+        state["last_status"] = "OK " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception as ex:
+        print("CHYBA API:", ex)
+        state["fail_runs"] = state.get("fail_runs", 0) + 1
+        state["last_status"] = f"chyba: {ex}"[:200]
+        if state["fail_runs"] == FAIL_WARN_RUNS:
+            ntfy("Hlídač Ironman nevidí slotmarket",
+                 f"Už ~2 h se nedaří načíst API. Poslední chyba: {ex}"[:400],
+                 priority=4, tags="warning")
     heartbeat(state)
-    state["last_run"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     save_state(state)
+
+
+def load_state():
+    if STATE_FILE.exists():
+        try:
+            return json.loads(STATE_FILE.read_text() or "{}")
+        except json.JSONDecodeError:
+            return {}
+    return {}
+
+
+def save_state(s):
+    STATE_FILE.write_text(json.dumps(s, indent=2, ensure_ascii=False) + "\n")
 
 
 if __name__ == "__main__":
