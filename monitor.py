@@ -76,7 +76,11 @@ def call(text):
                                 "text": text, "lang": "en-US-Standard-B"})
     try:
         r = requests.get(f"http://api.callmebot.com/start.php?{q}", timeout=120)
-        print("callmebot:", r.status_code, r.text[:300])
+       soup = BeautifulSoup(r.text, "html.parser")
+        for t in soup(["script", "style", "head"]):
+            t.decompose()
+        info = " ".join(soup.get_text(" ").split())
+        print("callmebot:", r.status_code, info[:600])
     except Exception as e:
         print("callmebot chyba:", e)
 
