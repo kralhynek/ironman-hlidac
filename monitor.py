@@ -70,11 +70,13 @@ def call(text):
     if DRY_RUN or not CALLMEBOT_USER:
         print(f"[call] {text}")
         return
-    q = urllib.parse.urlencode({"user": CALLMEBOT_USER, "text": text,
-                                "lang": "cs-CZ-Standard-A", "rpt": "3"})
+    # stejný formát jako ručně ověřený odkaz (anglický hlas, text bez diakritiky)
+    text = "IRONMAN HRADEC KRALOVE ALERT. CHECK NTFY NOW."
+    q = urllib.parse.urlencode({"source": "web", "user": CALLMEBOT_USER,
+                                "text": text, "lang": "en-US-Standard-B"})
     try:
-        r = requests.get(f"https://api.callmebot.com/start.php?{q}", timeout=60)
-        print("callmebot:", r.status_code, r.text[:200])
+        r = requests.get(f"http://api.callmebot.com/start.php?{q}", timeout=120)
+        print("callmebot:", r.status_code, r.text[:300])
     except Exception as e:
         print("callmebot chyba:", e)
 
