@@ -76,7 +76,7 @@ def call(text):
                                 "text": text, "lang": "en-US-Standard-B"})
     try:
         r = requests.get(f"http://api.callmebot.com/start.php?{q}", timeout=120)
-       soup = BeautifulSoup(r.text, "html.parser")
+        soup = BeautifulSoup(r.text, "html.parser")
         for t in soup(["script", "style", "head"]):
             t.decompose()
         info = " ".join(soup.get_text(" ").split())
