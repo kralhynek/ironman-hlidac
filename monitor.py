@@ -40,8 +40,9 @@ SCAN_FROM = 842                 # první volné ID v době psaní (2026-10-17)
 SCAN_WINDOW = 15
 NAME_RE = re.compile(r"IRONMAN\s*70\.3.*HRADEC.*2027", re.I)
 
-URGENT_REPEAT_RUNS = 6          # po otevření opakuj poplach 6× (~1 h)
-FAIL_WARN_RUNS = 12             # varování po ~2 h nedostupného API
+URGENT_REPEAT_RUNS = 4          # po otevření opakuj poplach ještě 3× (á 2 min)
+FAIL_WARN_RUNS = 30             # varování po ~1 h nedostupného API (při kontrole á 2 min)
+LOOP_INTERVAL = 120             # sekund mezi kontrolami ve smyčce
 
 NTFY_TOPIC = os.environ.get("NTFY_TOPIC", "").strip()
 CALLMEBOT_USER = os.environ.get("CALLMEBOT_USER", "").strip()
@@ -190,6 +191,21 @@ def main():
         alarm("TEST hlídače Ironman", "Tohle je zkušební poplach. Funguje to.")
         return
     state = load_state()
+    # --loop MINUT: kontroluje každé 2 minuty po dobu MINUT (GitHub cron je
+    # nespolehlivý a chodí třeba jen 1× za hodinu, takže smyčka díry zaplní)
+    minutes = float(sys.argv[sys.argv.index("--loop") + 1]) if "--loop" in sys.argv else 0
+    deadline = time.time() + minutes * 60
+    while True:
+        one_check(state)
+        save_state(state)
+        if time.time() + LOOP_INTERVAL > deadline:
+            break
+        time.sleep(LOOP_INTERVAL)
+    heartbeat(state)
+    save_state(state)
+
+
+def one_check(state):
     try:
         check(state)
         state["fail_runs"] = 0
@@ -200,10 +216,8 @@ def main():
         state["last_status"] = f"chyba: {ex}"[:200]
         if state["fail_runs"] == FAIL_WARN_RUNS:
             ntfy("Hlídač Ironman nevidí slotmarket",
-                 f"Už ~2 h se nedaří načíst API. Poslední chyba: {ex}"[:400],
+                 f"Už delší dobu se nedaří načíst API. Poslední chyba: {ex}"[:400],
                  priority=4, tags="warning")
-    heartbeat(state)
-    save_state(state)
 
 
 def load_state():
